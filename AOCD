@@ -1,0 +1,179 @@
+import os
+import sys
+import argparse
+import logging
+import time
+import numpy as np
+from PIL import Image
+try:
+    import cv2
+except ImportError:
+    print("Error: cv2 (OpenCV) not found. Install with: pip install opencv-python")
+    sys.exit(1)
+try:
+    import tensorflow as tf
+    from tensorflow.keras import models, layers, optimizers
+    from tensorflow.keras.preprocessing import image
+    from tensorflow.keras.applications import EfficientNetB0
+    from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
+except ImportError:
+    print("Error: TensorFlow or Keras not found. Install with: pip install tensorflow==2.20.0")
+    sys.exit(1)
+try:
+    from ultralytics.yolo import YOLO
+except ImportError:
+    print("Error: ultralytics.yolo not found. Install with: pip install ultralytics==8.2.0")
+    sys.exit(1)
+try:
+    import streamlit as st
+    from sklearn.metrics import classification_report, confusion_matrix
+    import seaborn as sns
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+except ImportError as e:
+    print(f"Error: Missing visualization libraries. Install with: pip install streamlit scikit-learn seaborn matplotlib. Error: {e}")
+    sys.exit(1)
+
+# Logging setup
+logging.basicConfig(filename='aerial_object_detection.log', level=logging.INFO)
+logging.info("Application started at 10:37 PM IST, October 22, 2025")
+
+def validate_dataset():
+    required = ['classification_dataset/TRAIN/bird', 'classification_dataset/TRAIN/drone',
+                'classification_dataset/VALID/bird', 'classification_dataset/VALID/drone',
+                'classification_dataset/TEST/bird', 'classification_dataset/TEST/drone',
+                'object_detection_dataset/train/images', 'object_detection_dataset/train/labels',
+                'object_detection_dataset/val/images', 'object_detection_dataset/val/labels',
+                'object_detection_dataset/test/images', 'object_detection_dataset/test/labels']
+    missing = [d for d in required if not os.path.exists(d)]
+    if missing:
+        raise FileNotFoundError(f"Missing directories: {missing}. Download datasets.")
+
+def setup_data_generators():
+    validate_dataset()
+    train_dir = 'classification_dataset/TRAIN'
+    val_dir = 'classification_dataset/VALID'
+    test_dir = 'classification_dataset/TEST'
+    def count_images(d): return len(os.listdir(os.path.join(d, 'bird'))) + len(os.listdir(os.path.join(d, 'drone')))
+    totals = [count_images(d) for d in [train_dir, val_dir, test_dir]]
+    print(f"Dataset Stats - Train: {totals[0]}, Val: {totals[1]}, Test: {totals[2]}")
+    train_datagen = image.ImageDataGenerator(rescale=1./255, rotation_range=20, width_shift_range=0.2, height_shift_range=0.2, shear_range=0.2, zoom_range=0.2, horizontal_flip=True)
+    val_datagen = image.ImageDataGenerator(rescale=1./255)
+    train_gen = train_datagen.flow_from_directory(train_dir, target_size=(224, 224), batch_size=32, class_mode='categorical')
+    val_gen = val_datagen.flow_from_directory(val_dir, target_size=(224, 224), batch_size=32, class_mode='categorical')
+    test_gen = val_datagen.flow_from_directory(test_dir, target_size=(224, 224), batch_size=32, class_mode='categorical', shuffle=False)
+    return train_gen, val_gen, test_gen, *totals
+
+def build_custom_cnn():
+    return models.Sequential([
+        layers.Conv2D(32, (3, 3), activation='relu', input_shape=(224, 224, 3)),
+        layers.BatchNormalization(), layers.MaxPooling2D(2, 2),
+        layers.Conv2D(64, (3, 3), activation='relu'),
+        layers.BatchNormalization(), layers.MaxPooling2D(2, 2),
+        layers.Conv2D(128, (3, 3), activation='relu'),
+        layers.BatchNormalization(), layers.MaxPooling2D(2, 2),
+        layers.Flatten(), layers.Dense(512, activation='relu'),
+        layers.Dropout(0.5), layers.Dense(2, activation='softmax')
+    ])
+
+def build_transfer_model():
+    base_model = EfficientNetB0(weights='imagenet', include_top=False, input_shape=(224, 224, 3))
+    base_model.trainable = False
+    return models.Sequential([base_model, layers.GlobalAveragePooling2D(), layers.Dense(256, activation='relu'), layers.Dropout(0.5), layers.Dense(2, activation='softmax')])
+
+def compile_model(model):
+    model.compile(optimizer=optimizers.Adam(learning_rate=0.001), loss='categorical_crossentropy', metrics=['accuracy'])
+    return model
+
+def train_model(model, name, train_gen, val_gen, total_train, total_val):
+    try:
+        callbacks = [EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True),
+                     ModelCheckpoint(f'best_{name}.keras', monitor='val_loss', save_best_only=True)]
+        history = model.fit(train_gen, steps_per_epoch=total_train // 32, epochs=50,
+                            validation_data=val_gen, validation_steps=total_val // 32,
+                            callbacks=callbacks, verbose=1)
+        model.save(f'{name}.keras')
+        print(f"✓ {name}.keras saved")
+        return history
+    except Exception as e:
+        print(f"Training {name} failed: {e}")
+        return None
+
+def evaluate_model(model, gen, name):
+    preds = model.predict(gen)
+    pred_classes = np.argmax(preds, axis=1)
+    true_classes = gen.classes
+    print(f"\nCLASSIFICATION REPORT - {name}\n{classification_report(true_classes, pred_classes, target_names=['bird', 'drone'])}")
+    cm = confusion_matrix(true_classes, pred_classes)
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=['bird', 'drone'], yticklabels=['bird', 'drone'])
+    plt.title(f'Confusion Matrix - {name}')
+    plt.savefig(f'confusion_matrix_{name.lower()}.png')
+    plt.close()
+
+def plot_history(history, name):
+    if history:
+        plt.figure(figsize=(12, 4))
+        plt.subplot(1, 2, 1); plt.plot(history.history['accuracy'], label='Train'); plt.plot(history.history['val_accuracy'], label='Val'); plt.title(f'Accuracy - {name}'); plt.legend()
+        plt.subplot(1, 2, 2); plt.plot(history.history['loss'], label='Train'); plt.plot(history.history['val_loss'], label='Val'); plt.title(f'Loss - {name}'); plt.legend()
+        plt.savefig(f'training_history_{name.lower()}.png')
+        plt.close()
+    else:
+        print(f"No history for {name}")
+
+def train_yolo():
+    if not os.path.exists('data.yaml'):
+        with open('data.yaml', 'w') as f:
+            f.write("""path: ./object_detection_dataset
+train: train/images
+val: val/images
+test: test/images
+names:
+  0: bird
+  1: drone""")
+    model = YOLO('yolov8n.pt')
+    model.train(data='data.yaml', epochs=50, imgsz=416, batch=8, name='yolo_aerial')
+    model.val()
+
+def streamlit_app():
+    st.set_page_config(page_title="Aerial Object Detection", layout="wide")
+    st.title('Aerial Object Classification & Detection')
+    if not (os.path.exists('transfer.keras') and os.path.exists('runs/detect/yolo_aerial/weights/best.pt')):
+        st.error("Models not found! Run: python aerial_object_detection.py --train")
+        return
+    model = models.load_model('transfer.keras')
+    yolo_model = YOLO('runs/detect/yolo_aerial/weights/best.pt')
+    st.success("Models loaded!")
+    uploaded = st.file_uploader('Upload Image', type=['jpg', 'png', 'jpeg'])
+    if uploaded:
+        img = Image.open(uploaded)
+        st.image(img, caption='Uploaded')
+        pred = model.predict(np.expand_dims(np.array(img.resize((224, 224))) / 255.0, 0))
+        cls = ['Bird', 'Drone'][np.argmax(pred[0])]
+        conf = pred[0].max() * 100
+        st.success(f"**{cls}** ({conf:.2f}%)")
+        results = yolo_model.predict(np.array(img), conf=0.25)
+        st.image(cv2.cvtColor(results[0].plot(), cv2.COLOR_BGR2RGB), caption='Detections')
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--train', action='store_true')
+    args = parser.parse_args()
+    if args.train:
+        train_gen, val_gen, test_gen, t_train, t_val, t_test = setup_data_generators()
+        custom = compile_model(build_custom_cnn())
+        custom_history = train_model(custom, 'custom_cnn', train_gen, val_gen, t_train, t_val)
+        transfer = compile_model(build_transfer_model())
+        transfer_history = train_model(transfer, 'transfer', train_gen, val_gen, t_train, t_val)
+        evaluate_model(custom, test_gen, 'Custom CNN')
+        evaluate_model(transfer, test_gen, 'Transfer Learning')
+        plot_history(custom_history, 'Custom CNN')
+        plot_history(transfer_history, 'Transfer Learning')
+        train_yolo()
+    else:
+        streamlit_app()
+
+if __name__ == '__main__':
+    main()
+    
